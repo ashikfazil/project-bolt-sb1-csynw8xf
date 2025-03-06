@@ -1,0 +1,18 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+.leaflet-container {
+  width: 100%;
+  height: 100%;
+}
+
+/* Geoman drawing controls styling */
+.leaflet-pm-toolbar {
+  border: 2px solid rgba(0, 0, 0, 0.2);
+  border-radius: 4px;
+}
+
+.leaflet-pm-toolbar .leaflet-pm-button {
+  padding: 5px;
+}
