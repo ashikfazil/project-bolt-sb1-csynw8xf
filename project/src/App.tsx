@@ -1,13 +1,13 @@
 import React, { useState, useEffect } from 'react';
-import { MapPin, Plus, Edit2 } from 'lucide-react';
+import { MapPin, Edit2 } from 'lucide-react';
 import { MapContainer, TileLayer, Marker, Popup, GeoJSON, useMap } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import '@geoman-io/leaflet-geoman-free/dist/leaflet-geoman.css';
 import * as L from 'leaflet';
 import '@geoman-io/leaflet-geoman-free';
-import { Icon } from 'leaflet';
-import { auth } from "./lib/firebase";
+import { auth, db } from "./lib/firebase";
 import { onAuthStateChanged, signOut } from "firebase/auth";
+import { collection, addDoc, getDocs, updateDoc, doc } from "firebase/firestore";
 import Login from "./login";
 
 // Fix for default marker icon
@@ -61,7 +61,7 @@ function DrawingControls() {
 }
 
 interface Property {
-  id: number;
+  id: string;
   position: [number, number];
   owner: string;
   address: string;
@@ -69,8 +69,16 @@ interface Property {
   floors?: number;
   yearBuilt?: number;
   squareFootage: number;
-  plot?: any;
-  building?: any;
+  plot?: {
+    type: string;
+    properties: { owner: string };
+    geometry: { type: string; coordinates: any }; // Will be parsed from string
+  };
+  building?: {
+    type: string;
+    properties: { owner: string };
+    geometry: { type: string; coordinates: any }; // Will be parsed from string
+  };
 }
 
 function App() {
@@ -87,14 +95,46 @@ function App() {
     yearBuilt: '',
     squareFootage: ''
   });
+  const [error, setError] = useState<string | null>(null);
 
-  // Auth state management
+  // Auth state management and fetch properties
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
       setUser(currentUser);
+      if (currentUser) {
+        fetchProperties(currentUser.uid);
+      } else {
+        setProperties([]);
+      }
     });
     return () => unsubscribe();
   }, []);
+
+  // Fetch properties from Firestore
+  const fetchProperties = async (uid: string) => {
+    try {
+      const querySnapshot = await getDocs(collection(db, `users/${uid}/properties`));
+      const propertiesData: Property[] = querySnapshot.docs.map(doc => {
+        const data = doc.data();
+        // Parse coordinates if they were stringified
+        if (data.plot?.geometry?.coordinates) {
+          data.plot.geometry.coordinates = JSON.parse(data.plot.geometry.coordinates);
+        }
+        if (data.building?.geometry?.coordinates) {
+          data.building.geometry.coordinates = JSON.parse(data.building.geometry.coordinates);
+        }
+        return {
+          id: doc.id,
+          ...data
+        } as Property;
+      });
+      setProperties(propertiesData);
+      setError(null);
+    } catch (error) {
+      console.error("Error fetching properties:", error);
+      setError("Failed to load properties. Please try again.");
+    }
+  };
 
   // Property drawing event listener
   useEffect(() => {
@@ -140,70 +180,96 @@ function App() {
     setCurrentDrawing(null);
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    
+
     const floors = formData.floors ? parseInt(formData.floors) : undefined;
     const yearBuilt = formData.yearBuilt ? parseInt(formData.yearBuilt) : undefined;
     const squareFootage = parseInt(formData.squareFootage);
 
-    if (editingProperty) {
-      const updatedProperties = properties.map(prop => 
-        prop.id === editingProperty.id
-          ? { ...prop, ...formData, floors, yearBuilt, squareFootage }
-          : prop
-      );
-      setProperties(updatedProperties);
-    } else if (currentDrawing) {
-      const newProperty: Property = {
-        id: Date.now(),
-        position: [
-          currentDrawing.coordinates[0][0][1],
-          currentDrawing.coordinates[0][0][0]
-        ],
-        owner: formData.owner,
-        address: formData.address,
-        propertyType: formData.propertyType,
-        floors,
-        yearBuilt,
-        squareFootage
-      };
+    if (!user) return;
 
-      if (currentDrawing.propertyType === 'plot') {
-        newProperty.plot = {
-          type: "Feature",
-          properties: { owner: formData.owner },
-          geometry: {
-            type: "Polygon",
-            coordinates: currentDrawing.coordinates
-          }
+    try {
+      if (editingProperty) {
+        const propertyRef = doc(db, `users/${user.uid}/properties`, editingProperty.id);
+        const updatedData = {
+          owner: formData.owner,
+          address: formData.address,
+          propertyType: formData.propertyType,
+          floors,
+          yearBuilt,
+          squareFootage,
+          // Preserve plot/building data if it exists, no coordinates change on edit
+          ...(editingProperty.plot && { plot: editingProperty.plot }),
+          ...(editingProperty.building && { building: editingProperty.building })
         };
-      } else {
-        newProperty.building = {
-          type: "Feature",
-          properties: { owner: formData.owner },
-          geometry: {
-            type: "Polygon",
-            coordinates: currentDrawing.coordinates
-          }
+        await updateDoc(propertyRef, updatedData);
+        const updatedProperties = properties.map(prop =>
+          prop.id === editingProperty.id
+            ? { ...prop, ...formData, floors, yearBuilt, squareFootage }
+            : prop
+        );
+        setProperties(updatedProperties);
+      } else if (currentDrawing) {
+        const newProperty: Property = {
+          id: '',
+          position: [
+            currentDrawing.coordinates[0][0][1],
+            currentDrawing.coordinates[0][0][0]
+          ],
+          owner: formData.owner,
+          address: formData.address,
+          propertyType: formData.propertyType,
+          floors,
+          yearBuilt,
+          squareFootage
         };
+
+        if (currentDrawing.propertyType === 'plot') {
+          newProperty.plot = {
+            type: "Feature",
+            properties: { owner: formData.owner },
+            geometry: {
+              type: "Polygon",
+              coordinates: JSON.stringify(currentDrawing.coordinates) // Stringify coordinates
+            }
+          };
+        } else {
+          newProperty.building = {
+            type: "Feature",
+            properties: { owner: formData.owner },
+            geometry: {
+              type: "Polygon",
+              coordinates: JSON.stringify(currentDrawing.coordinates) // Stringify coordinates
+            }
+          };
+        }
+
+        const docRef = await addDoc(collection(db, `users/${user.uid}/properties`), newProperty);
+        newProperty.id = docRef.id;
+        // Parse coordinates back to array for local state
+        if (newProperty.plot) newProperty.plot.geometry.coordinates = currentDrawing.coordinates;
+        if (newProperty.building) newProperty.building.geometry.coordinates = currentDrawing.coordinates;
+        setProperties([...properties, newProperty]);
+        currentDrawing.layer.remove();
       }
 
-      setProperties([...properties, newProperty]);
-      currentDrawing.layer.remove();
+      setShowForm(false);
+      setFormData({
+        owner: '',
+        address: '',
+        propertyType: '',
+        floors: '',
+        yearBuilt: '',
+        squareFootage: ''
+      });
+      setEditingProperty(null);
+      setCurrentDrawing(null);
+      setError(null);
+    } catch (error) {
+      console.error("Error saving property:", error);
+      setError("Failed to save property. Please try again.");
     }
-
-    setShowForm(false);
-    setFormData({
-      owner: '',
-      address: '',
-      propertyType: '',
-      floors: '',
-      yearBuilt: '',
-      squareFootage: ''
-    });
-    setEditingProperty(null);
-    setCurrentDrawing(null);
   };
 
   if (!user) return <Login />;
@@ -242,6 +308,7 @@ function App() {
       </header>
 
       <main className="max-w-7xl mx-auto px-4 py-6 sm:px-6 lg:px-8">
+        {error && <div className="text-red-500 mb-4">{error}</div>}
         <div className="bg-white rounded-lg shadow-lg overflow-hidden">
           <div className="h-[70vh] z-0 relative">
             <MapContainer
@@ -268,7 +335,7 @@ function App() {
                             <p class="text-sm text-gray-500">${property.propertyType}</p>
                             <p class="text-sm text-gray-500">Total Area: ${property.squareFootage} sq ft</p>
                             <button
-                              onclick="window.handlePropertyEdit(${property.id})"
+                              onclick="window.handlePropertyEdit('${property.id}')"
                               class="mt-2 px-3 py-1 bg-blue-500 text-white rounded-md text-sm hover:bg-blue-600"
                             >
                               Edit Property
@@ -291,7 +358,7 @@ function App() {
                             <p class="text-sm text-gray-500">Year Built: ${property.yearBuilt || 'N/A'}</p>
                             <p class="text-sm text-gray-500">Area: ${property.squareFootage} sq ft</p>
                             <button
-                              onclick="window.handlePropertyEdit(${property.id})"
+                              onclick="window.handlePropertyEdit('${property.id}')"
                               class="mt-2 px-3 py-1 bg-blue-500 text-white rounded-md text-sm hover:bg-blue-600"
                             >
                               Edit Property
@@ -430,7 +497,7 @@ function App() {
 }
 
 if (typeof window !== 'undefined') {
-  window.handlePropertyEdit = (propertyId: number) => {
+  window.handlePropertyEdit = (propertyId: string) => {
     const event = new CustomEvent('editProperty', { detail: { propertyId } });
     window.dispatchEvent(event);
   };
